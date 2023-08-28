@@ -97,7 +97,7 @@ app.UseWebSockets(new WebSocketOptions { KeepAliveInterval = TimeSpan.FromMinute
 
 #region Hub Endpoints
 
-app.MapHub<DrawHub>(Endpoints.WhiteBoardDrawHub).RequireAuthorization();
+app.MapHub<WhiteBoardHub>(Endpoints.WhiteBoardHub).RequireAuthorization();
 
 #endregion
 
@@ -173,7 +173,7 @@ Func<JwtBearerChallengeContext, Task> OnChallenge()
 /// </summary>
 internal static class Endpoints
 {
-    public const string WhiteBoardDrawHub = "/drw";
+    public const string WhiteBoardHub = "/whiteboard";
     public const string CreateRoom = "/api/rooms";
     public const string GetRoom = "/api/room/{id}";
 }

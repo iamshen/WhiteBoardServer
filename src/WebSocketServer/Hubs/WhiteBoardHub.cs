@@ -1,9 +1,15 @@
 ﻿using System.Security.Claims;
+using System.Text.Json;
+using Ardalis.GuardClauses;
 using Infrastructure.Constants;
 using Infrastructure.Dtos.Room;
+using Infrastructure.Redis;
 using Infrastructure.SignalR;
+using Infrastructure.ValueObjects;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.SignalR;
+using Microsoft.Extensions.Caching.StackExchangeRedis;
+using StackExchange.Redis;
 
 namespace WebSocketServer.Hubs;
 
@@ -12,21 +18,29 @@ namespace WebSocketServer.Hubs;
 // 2. 成功创建房间后，服务端返回新建房间的 roomId roomToken
 // 3. 客户端调用 Signalr SDK 加入白板房间。
 [Authorize]
-public class DrawHub : Hub
+public class WhiteBoardHub : Hub
 {
     private const string DefaultGroup = "defaultGroup";
+    private const string DrawHistoryKey = "drawing_history_{0}";
     private readonly IConnectionUserCache _cache;
     private readonly ILogger _logger;
+    private readonly IDatabase _redisDb;
 
     /// <summary>
     ///     ctor
     /// </summary>
     /// <param name="cache"></param>
     /// <param name="factory"></param>
-    public DrawHub(IConnectionUserCache cache, ILoggerFactory factory)
+    /// <param name="configuration"></param>
+    public WhiteBoardHub(IConnectionUserCache cache, ILoggerFactory factory, IConfiguration configuration)
     {
         _cache = cache;
-        _logger = factory.CreateLogger<DrawHub>();
+        _logger = factory.CreateLogger<WhiteBoardHub>();
+
+        var redisCacheOptions = configuration.GetSection(nameof(RedisCacheOptions)).Get<RedisCacheOptions>();
+        Guard.Against.Null(redisCacheOptions);
+        var connection = RedisConnectionHelper.Connect(redisCacheOptions.Configuration!);
+        _redisDb = connection.GetDatabase();
     }
 
     /// <summary>
@@ -37,7 +51,7 @@ public class DrawHub : Hub
     /// <param name="currentX"></param>
     /// <param name="currentY"></param>
     /// <param name="color"></param>
-    public virtual async Task Draw(int prevX, int prevY, int currentX, int currentY, string color)
+    public async Task Draw(int prevX, int prevY, int currentX, int currentY, string color)
     {
         // 1. 谁操作-画笔操作人
         var user = Context.User.GetUserInfo();
@@ -53,36 +67,71 @@ public class DrawHub : Hub
             await Clients.Caller.SendAsync(Events.DrawError, Errors.RoomNotFound);
             return;
         }
-        
+
         // 2. 确保操作人拥有绘画权限
         if (!EnsureDrawPermissions(room))
         {
             await Clients.Caller.SendAsync(Events.DrawError, Errors.UnAuthority);
             return;
         }
-        
-        // 3. 发送给谁- 广播给当前操作人的房间的 group
-        await Clients.GroupExcept(room.RoomId, Context.ConnectionId).SendAsync(HubClientMethods.Draw, prevX, prevY, currentX, currentY, color, user);
 
-        // 4. 把绘图数据写入 分布式缓存 redis 中, 以提供后续可以执行撤销操作.
-        
-        
-        
+        // 4. 保存绘图数据到 Redis，并广播给其他用户
+        var drawingData = new DrawingData
+        {
+            PrevX = prevX,
+            PrevY = prevY,
+            CurrentX = currentX,
+            CurrentY = currentY,
+            Color = color,
+            User = user
+        };
+        await SaveDrawingDataToRedis(room.RoomId, drawingData);
+        await BroadcastDrawingData(room.RoomId, drawingData);
     }
-
-    private static bool EnsureDrawPermissions(RoomInfo roomInfo)
+    
+    /// <summary>
+    /// 撤销操作 （TODO: 执行撤销逻辑）
+    /// </summary>
+    public async Task Undo()
     {
-        //TODO: 确保操作人拥有绘画权限
+        var user = Context.User.GetUserInfo();
+        if (user is null)
+        {
+            await Clients.Caller.SendAsync(Events.UndoError, Errors.UnAuthentication);
+            return;
+        }
 
-        return true;
+        var room = await Context.GetRoomAsync();
+        if (room is null)
+        {
+            await Clients.Caller.SendAsync(Events.UndoError, Errors.RoomNotFound);
+            return;
+        }
+
+        var key = string.Format(DrawHistoryKey, room.RoomId);
+        var lastDrawingData = await _redisDb.ListRightPopAsync(key);
+        if (!lastDrawingData.IsNullOrEmpty)
+        {
+            var drawingData = JsonSerializer.Deserialize<DrawingData>(lastDrawingData);
+            if (drawingData is null)
+            {
+                return;
+            }
+            
+            // TODO: 执行撤销逻辑
+            // 更新绘图画布
+            // var canvas = GetCanvas(roomId); // 获取绘图画布，可以是一个二维数组...
+            
+        }
     }
+
 
     /// <summary>
-    /// 加入房间
+    ///     加入房间
     /// </summary>
     /// <returns></returns>
-    public virtual async Task JoinRoom()
-    {  
+    public async Task Join()
+    {
         var roomInfo = await Context.GetRoomAsync();
         if (roomInfo is null) return;
 
@@ -90,16 +139,32 @@ public class DrawHub : Hub
     }
 
     /// <summary>
-    /// 离开房间
+    ///     离开房间
     /// </summary>
-    /// <param name="roomIds">房间Id</param>
     /// <returns></returns>
-    public virtual async Task RemoveFromRoom(IEnumerable<string> roomIds)
+    public async Task Leave()
     {
         var roomInfo = await Context.GetRoomAsync();
         if (roomInfo is null) return;
 
         await Groups.RemoveFromGroupAsync(Context.ConnectionId, roomInfo.RoomId);
+    }
+
+    /// <summary>
+    ///     关闭房间
+    /// </summary>
+    public async Task TakeOff()
+    {
+        var roomInfo = await Context.GetRoomAsync();
+        if (roomInfo is null) return;
+
+        await Groups.RemoveFromGroupAsync(Context.ConnectionId, roomInfo.RoomId);
+
+        // 保存绘图记录
+
+        // 保存文件
+
+        // 保存录像
     }
 
     #region 连接已打开
@@ -173,27 +238,6 @@ public class DrawHub : Hub
 
     #endregion
 
-    #region 私有方法
-
-    /// <summary>
-    ///     权限验证
-    /// </summary>
-    /// <returns></returns>
-    private bool IsAuthorized()
-    {
-        // 验证账号状态
-        var identity = Context.User?.Identity;
-        var statusClaim = identity is not ClaimsIdentity claimsIdentity
-            ? "0"
-            : claimsIdentity.FindFirst(JwtConstants.Claims.Status)?.Value;
-
-        var status = string.IsNullOrWhiteSpace(statusClaim) ? 0 : int.Parse(statusClaim);
-
-        return status == 0;
-    }
-
-    #endregion
-
     public static class Errors
     {
         public const string UnAuthentication = "用户未登录!";
@@ -215,5 +259,63 @@ public class DrawHub : Hub
     {
         public const string ConnectionError = "connectionError";
         public const string DrawError = "drawError";
+        public const string UndoError = "unDoError";
     }
+
+    #region 私有方法
+
+    /// <summary>
+    ///     权限验证
+    /// </summary>
+    /// <returns></returns>
+    private bool IsAuthorized()
+    {
+        // 验证账号状态
+        var identity = Context.User?.Identity;
+        var statusClaim = identity is not ClaimsIdentity claimsIdentity
+            ? "0"
+            : claimsIdentity.FindFirst(JwtConstants.Claims.Status)?.Value;
+
+        var status = string.IsNullOrWhiteSpace(statusClaim) ? 0 : int.Parse(statusClaim);
+
+        return status == 0;
+    }
+
+
+    /// <summary>
+    ///     保存绘图数据到 Redis
+    /// </summary>
+    /// <param name="roomId"></param>
+    /// <param name="drawingData"></param>
+    /// <exception cref="NotImplementedException"></exception>
+    private async Task SaveDrawingDataToRedis(string roomId, DrawingData drawingData)
+    {
+        var serializedData = drawingData.Serialize();
+        await _redisDb.ListLeftPushAsync(string.Format(DrawHistoryKey, roomId), serializedData);
+    }
+
+    /// <summary>
+    ///     广播给其他用户
+    /// </summary>
+    /// <param name="roomId"></param>
+    /// <param name="drawingData"></param>
+    /// <exception cref="NotImplementedException"></exception>
+    private async Task BroadcastDrawingData(string roomId, DrawingData drawingData)
+    {
+        var serializedData = drawingData.Serialize();
+        await Clients.Group(roomId).SendAsync(HubClientMethods.Draw, serializedData);
+    }
+
+    /// <summary>
+    ///     TODO: 确保操作人拥有绘画权限
+    /// </summary>
+    /// <param name="roomInfo"></param>
+    /// <returns></returns>
+    private static bool EnsureDrawPermissions(RoomInfo roomInfo)
+    {
+        Console.WriteLine(roomInfo.Serialize());
+        return true;
+    }
+
+    #endregion
 }
